@@ -4,6 +4,7 @@ import threading
 import numpy as np
 import cv2
 
+# Try to load TensorFlow Lite runtime first
 try:
     from tflite_runtime.interpreter import Interpreter
     print("Using tflite_runtime interpreter")
@@ -12,25 +13,31 @@ except ImportError:
     Interpreter = tf.lite.Interpreter
     print("Using tensorflow.lite interpreter")
 
+# Load audio player
 try:
     from playsound import playsound
 except ImportError:
     raise RuntimeError("Please install playsound (pip install playsound==1.3.0)")
 
-def play_audio(path):
+# Play audio in the same thread so we can wait for it to finish
+def play_audio_blocking(path):
     if os.path.exists(path):
-        threading.Thread(target=lambda: playsound(path), daemon=True).start()
+        print(f"Playing audio: {path}")
+        playsound(path)
     else:
-        print("Audio not found:", path)
+        print(f"Audio not found for this label: {path}")
 
+# Load label list from text file
 def load_labels(path):
     return [l.strip() for l in open(path, 'r').read().splitlines() if l.strip()]
 
+# Load TFLite model
 def load_tflite(model_path):
     interp = Interpreter(model_path=model_path)
     interp.allocate_tensors()
     return interp, interp.get_input_details(), interp.get_output_details()
 
+# Run classification on frame
 def classify(interp, inp_details, out_details, frame, normalize='-1'):
     h, w = inp_details[0]['shape'][1:3]
     img = cv2.resize(frame, (w, h))
@@ -57,46 +64,49 @@ FLOWER_LABEL = os.path.join(MODEL_DIR, "flower_labels.txt")
 FACE_MODEL   = os.path.join(MODEL_DIR, "face_model.tflite")
 FACE_LABEL   = os.path.join(MODEL_DIR, "face_labels.txt")
 
-AUDIO_DIR = "assets/audio"
+# Audio mapping
 AUDIO_MAP = {
-    "sunflower": os.path.join(AUDIO_DIR, "sunflower.mp3"),
-    "rose": os.path.join(AUDIO_DIR, "rose.mp3"),
-    "daisy": os.path.join(AUDIO_DIR, "daisy.mp3"),
-    "bald": os.path.join(AUDIO_DIR, "bald.mp3"),
-    "beard": os.path.join(AUDIO_DIR, "beard.mp3"),
-    "glasses": os.path.join(AUDIO_DIR, "glasses.mp3"),
-    "unknown": os.path.join(AUDIO_DIR, "default.mp3")
+    "sunflower": "assets/audio/sunflower.wav",
+    "rose": "assets/audio/rose.mp3",
+    "daisy": "assets/audio/daisy.wav",
+    "dandelion": "assets/audio/dandelion.mp3",
+    "beard": "assets/audio/beard.mp3",
+    "glasses": "assets/audio/glasses.mp3"
 }
 
-# State
+# Modes
 MODE_FLOWER = "FLOWER"
 MODE_FACE = "FACE"
 mode = MODE_FLOWER
 interp, inp_details, out_details = load_tflite(FLOWER_MODEL)
 labels = load_labels(FLOWER_LABEL)
 print(f"Loaded {mode} model with labels: {labels}")
-CONF_THRESHOLD = 0.4
-DETECT_INTERVAL = 1.5
-last_detect = 0
 
+# Config
+CONF_THRESHOLD = 0.95      # confidence threshold
+REQUIRED_COUNT = 30      # consecutive detections needed
+
+# Detection tracking
+last_label = None
+confidence_count = 0
+flower_detected = False
+
+# Open webcam
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
     raise RuntimeError("Cannot open webcam")
 
-print("Press 'm' to toggle mode, 'd' to detect now, 'q' to quit")
+print("Press 'm' to toggle mode, 'q' to quit")
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    h, w, _ = frame.shape
-    cv2.putText(frame, f"Mode: {mode}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+    cv2.putText(frame, f"Mode: {mode}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
     cv2.imshow("LOL Lens", frame)
     key = cv2.waitKey(1) & 0xFF
-
-    now = time.time()
-    do_detect = False
 
     if key == ord('q'):
         break
@@ -109,25 +119,40 @@ while True:
             interp, inp_details, out_details = load_tflite(FACE_MODEL)
             labels = load_labels(FACE_LABEL)
         print("Switched to", mode, "model:", labels)
-        last_detect = 0
-    elif key == ord('d'):
-        do_detect = True
+        last_label = None
+        confidence_count = 0
 
-    if now - last_detect > DETECT_INTERVAL:
-        do_detect = True
-
-    if do_detect:
+    if not flower_detected and mode == MODE_FLOWER:
         idx, conf = classify(interp, inp_details, out_details, frame, normalize='-1')
-        label = labels[idx] if idx < len(labels) else "unknown"
-        print("Detected:", label, "confidence:", conf)
+        raw_label = labels[idx].strip() if idx < len(labels) else "unknown"
+        # Remove number prefix if present
+        label_parts = raw_label.split()
+        if label_parts and label_parts[0].isdigit():
+            label = " ".join(label_parts[1:]).strip().lower()
+        else:
+            label = raw_label.lower()
+
+        print(f"Detected: {label} confidence: {conf:.3f}")
 
         if conf >= CONF_THRESHOLD:
-            play_audio(AUDIO_MAP.get(label, AUDIO_MAP["unknown"]))
-            last_detect = now
+            if label == last_label:
+                confidence_count += 1
+            else:
+                last_label = label
+                confidence_count = 1
+            print(f"Consecutive high-confidence count: {confidence_count}")
         else:
-            print("Low confidence; skipping")
+            confidence_count = 0
+
+        if confidence_count >= REQUIRED_COUNT:
+            print(f"Flower '{label}' detected with high confidence {REQUIRED_COUNT} times — stopping detection.")
+            if label in AUDIO_MAP:
+                play_audio_blocking(AUDIO_MAP[label])  # Play audio and wait for it
+            else:
+                print(f"No matching audio for label: {label}")
+            flower_detected = True
+            break  # Exit after audio
 
 cap.release()
 cv2.destroyAllWindows()
 print("Exiting...")
-hi
